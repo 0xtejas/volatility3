@@ -192,8 +192,9 @@ class CommandLine:
             "--file",
             metavar="FILE",
             default=None,
+            nargs="+",
             type=str,
-            help="Shorthand for --single-location=file:// if single-location is not defined",
+            help="Shorthand for --single-location=file:// if single-location is not defined; accepts multiple files to run the plugin against each in sequence",
         )
         parser.add_argument(
             "--write-config",
@@ -346,7 +347,6 @@ class CommandLine:
         )
 
         seen_automagics = set()
-        chosen_configurables_list = {}
         for amagic in automagics:
             if amagic in seen_automagics:
                 continue
@@ -408,120 +408,173 @@ class CommandLine:
         )
 
         plugin = plugin_list[args.plugin]
-        chosen_configurables_list[args.plugin] = plugin
         base_config_path = "plugins"
         plugin_config_path = interfaces.configuration.path_join(
             base_config_path, plugin.__name__
         )
 
-        # Special case the -f argument because people use is so frequently
-        # It has to go here so it can be overridden by single-location if it's defined
-        # NOTE: This will *BREAK* if LayerStacker, or the automagic configuration system, changes at all
-        ###
-        if args.file:
-            try:
-                single_location = requirements.URIRequirement.location_from_file(
-                    args.file
-                )
-                ctx.config["automagic.LayerStacker.single_location"] = single_location
-            except ValueError as excp:
-                parser.error(str(excp))
-
-        # UI fills in the config, here we load it from the config file and do it before we process the CL parameters
-        if args.config:
-            with open(args.config) as f:
-                json_val = json.load(f)
-                ctx.config.splice(
-                    plugin_config_path,
-                    interfaces.configuration.HierarchicalDict(json_val),
-                )
-
-        # It should be up to the UI to determine which automagics to run, so this is before BACK TO THE FRAMEWORK
-        automagics = automagic.choose_automagic(automagics, plugin)
-        for amagic in automagics:
-            chosen_configurables_list[amagic.__class__.__name__] = amagic
-
-        if ctx.config.get("automagic.LayerStacker.stackers", None) is None:
-            ctx.config["automagic.LayerStacker.stackers"] = stacker.choose_os_stackers(
-                plugin
-            )
         self.output_dir = args.output_dir
         if not os.path.exists(self.output_dir):
             parser.error(
                 f"The output directory specified does not exist: {self.output_dir}"
             )
 
-        self.populate_config(ctx, chosen_configurables_list, args, plugin_config_path)
+        # Support running against multiple images: iterate over each provided file (or
+        # once with no file if -f was not given).
+        files = args.file if args.file else [None]
+        save_config_done = False
 
-        if args.extend:
-            for extension in args.extend:
-                if "=" not in extension:
-                    raise ValueError(
-                        "Invalid extension (extensions must be of the format \"conf.path.value='value'\")"
+        for current_file in files:
+            if len(files) > 1:
+                banner_output.write(f"\n--- Processing: {current_file} ---\n")
+
+            # Create a fresh context for each file so that state from a previous run
+            # does not bleed into subsequent ones.
+            ctx = contexts.Context()
+
+            # UI fills in the config, here we load it from the config file and do it before we process the CL parameters
+            if args.config:
+                with open(args.config) as f:
+                    json_val = json.load(f)
+                    ctx.config.splice(
+                        plugin_config_path,
+                        interfaces.configuration.HierarchicalDict(json_val),
                     )
-                address, value = (
-                    extension[: extension.find("=")],
-                    json.loads(extension[extension.find("=") + 1 :]),
+
+            # It should be up to the UI to determine which automagics to run, so this is before BACK TO THE FRAMEWORK
+            ctx_automagics = automagic.available(ctx)
+            ctx_automagics = automagic.choose_automagic(ctx_automagics, plugin)
+            chosen_configurables_list = {args.plugin: plugin}
+            for amagic in ctx_automagics:
+                chosen_configurables_list[amagic.__class__.__name__] = amagic
+
+            # Special case the -f argument because people use it so frequently.
+            # Set the location using the discovered LayerStacker config path rather
+            # than a hard-coded key.
+            if current_file:
+                try:
+                    single_location = requirements.URIRequirement.location_from_file(
+                        current_file
+                    )
+                except ValueError as excp:
+                    if len(files) > 1:
+                        vollog.warning(f"Skipping {current_file}: {excp}")
+                        continue
+                    else:
+                        parser.error(str(excp))
+
+                layer_stacker = next(
+                    (
+                        amagic
+                        for amagic in ctx_automagics
+                        if isinstance(amagic, stacker.LayerStacker)
+                    ),
+                    None,
                 )
-                ctx.config[address] = value
+                if layer_stacker is not None:
+                    layer_stacker_single_location = interfaces.configuration.path_join(
+                        layer_stacker.config_path, "single_location"
+                    )
+                    ctx.config[layer_stacker_single_location] = single_location
+                else:
+                    vollog.warning(
+                        "LayerStacker automagic was unavailable; --file could not "
+                        "set single_location for this run"
+                    )
 
-        ###
-        # BACK TO THE FRAMEWORK
-        ###
-        constructed = None
-        try:
-            progress_callback = PrintedProgress()
-            if args.quiet:
-                progress_callback = MuteProgress()
+            if ctx.config.get("automagic.LayerStacker.stackers", None) is None:
+                ctx.config["automagic.LayerStacker.stackers"] = (
+                    stacker.choose_os_stackers(plugin)
+                )
 
-            constructed = plugins.construct_plugin(
-                ctx,
-                automagics,
-                plugin,
-                base_config_path,
-                progress_callback,
-                self.file_handler_class_factory(),
+            self.populate_config(
+                ctx, chosen_configurables_list, args, plugin_config_path
             )
 
-            if args.write_config:
-                vollog.warning(
-                    "Use of --write-config has been deprecated, replaced by --save-config <filename>"
-                )
-                args.save_config = "config.json"
-            if args.save_config:
-                vollog.debug("Writing out configuration data to {args.save_config}")
-                if os.path.exists(os.path.abspath(args.save_config)):
-                    parser.error(
-                        f"Cannot write configuration: file {args.save_config} already exists"
+            if args.extend:
+                for extension in args.extend:
+                    if "=" not in extension:
+                        raise ValueError(
+                            "Invalid extension (extensions must be of the format \"conf.path.value='value'\")"
+                        )
+                    address, value = (
+                        extension[: extension.find("=")],
+                        json.loads(extension[extension.find("=") + 1 :]),
                     )
-                with open(args.save_config, "w") as f:
-                    json.dump(
-                        dict(constructed.build_configuration()),
-                        f,
-                        sort_keys=True,
-                        indent=2,
-                    )
-                    f.write("\n")
-        except exceptions.UnsatisfiedException as excp:
-            self.process_unsatisfied_exceptions(excp)
-            parser.exit(
-                1,
-                f"Unable to validate the plugin requirements: {[x for x in excp.unsatisfied]}\n",
-            )
+                    ctx.config[address] = value
 
-        try:
-            # Construct and run the plugin
-            if constructed:
-                vollog.debug(
-                    f"Successfully constructed {args.plugin} {constructed.version}"
+            ###
+            # BACK TO THE FRAMEWORK
+            ###
+            constructed = None
+            try:
+                progress_callback = PrintedProgress()
+                if args.quiet:
+                    progress_callback = MuteProgress()
+
+                constructed = plugins.construct_plugin(
+                    ctx,
+                    ctx_automagics,
+                    plugin,
+                    base_config_path,
+                    progress_callback,
+                    self.file_handler_class_factory(),
                 )
-                grid = constructed.run()
-                renderer = renderers[args.renderer]()
-                renderer.filter = text_filter.CLIFilter(grid, args.filters)
-                renderer.column_hide_list = args.hide_columns
-                renderer.render(grid)
-        except exceptions.VolatilityException as excp:
-            self.process_exceptions(excp)
+
+                if args.write_config:
+                    vollog.warning(
+                        "Use of --write-config has been deprecated, replaced by --save-config <filename>"
+                    )
+                    args.save_config = "config.json"
+                if args.save_config:
+                    if len(files) > 1 and save_config_done:
+                        vollog.warning(
+                            "--save-config is only applied to the first image when multiple images are specified"
+                        )
+                    else:
+                        vollog.debug(
+                            f"Writing out configuration data to {args.save_config}"
+                        )
+                        if os.path.exists(os.path.abspath(args.save_config)):
+                            parser.error(
+                                f"Cannot write configuration: file {args.save_config} already exists"
+                            )
+                        with open(args.save_config, "w") as f:
+                            json.dump(
+                                dict(constructed.build_configuration()),
+                                f,
+                                sort_keys=True,
+                                indent=2,
+                            )
+                            f.write("\n")
+                        save_config_done = True
+            except exceptions.UnsatisfiedException as excp:
+                self.process_unsatisfied_exceptions(excp)
+                if len(files) > 1:
+                    vollog.warning(
+                        f"Skipping {current_file}: unable to satisfy plugin requirements: "
+                        f"{[x for x in excp.unsatisfied]}"
+                    )
+                    continue
+                else:
+                    parser.exit(
+                        1,
+                        f"Unable to validate the plugin requirements: {[x for x in excp.unsatisfied]}\n",
+                    )
+
+            try:
+                # Construct and run the plugin
+                if constructed:
+                    vollog.debug(
+                        f"Successfully constructed {args.plugin} {constructed.version}"
+                    )
+                    grid = constructed.run()
+                    renderer = renderers[args.renderer]()
+                    renderer.filter = text_filter.CLIFilter(grid, args.filters)
+                    renderer.column_hide_list = args.hide_columns
+                    renderer.render(grid)
+            except exceptions.VolatilityException as excp:
+                self.process_exceptions(excp, exit_on_error=len(files) == 1)
 
     @classmethod
     def location_from_file(cls, filename: str) -> str:
@@ -582,8 +635,15 @@ class CommandLine:
                 return delayed_logs, result
         return delayed_logs, {}
 
-    def process_exceptions(self, excp):
-        """Provide useful feedback if an exception occurs during a run of a plugin."""
+    def process_exceptions(self, excp, exit_on_error: bool = True):
+        """Provide useful feedback if an exception occurs during a run of a plugin.
+
+        Args:
+            excp: The exception to process.
+            exit_on_error: If True (the default), call sys.exit(1) after reporting the
+                exception.  Pass False when running against multiple images so that
+                processing can continue with the next image.
+        """
         # Ensure there's nothing in the cache
         sys.stdout.write("\n\n")
         sys.stdout.flush()
@@ -669,7 +729,8 @@ class CommandLine:
         for cause in caused_by:
             output.write(f"	* {cause}\n")
         output.write("\nNo further results will be produced\n")
-        sys.exit(1)
+        if exit_on_error:
+            sys.exit(1)
 
     def process_unsatisfied_exceptions(self, excp):
         """Provide useful feedback if an exception occurs during requirement fulfillment."""
